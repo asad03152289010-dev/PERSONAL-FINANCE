@@ -1,0 +1,11 @@
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+/data/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+
+.vercel
