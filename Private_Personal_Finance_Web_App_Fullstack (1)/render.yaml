@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: personal-finance-vault
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:application --workers 1 --bind 0.0.0.0:$PORT --access-logfile -
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /data/finance.db
+      - key: OWNER_SETUP_KEY
+        sync: false
+    disk:
+      name: private-finance-data
+      mountPath: /data
+      sizeGB: 1
