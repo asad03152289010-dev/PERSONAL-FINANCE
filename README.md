@@ -1,95 +1,11 @@
-# Vault — Private Freelance + Personal Finance
+# Private Personal Finance Web App — Vercel + PostgreSQL
 
-An actual full-stack finance web app, not a mockup. It has a Python WSGI backend, a private owner account, an SQLite database, and a responsive single-page dashboard. Suitable for a single account, with multiple years of data. Your old Excel file is unchanged; this is a new app/database and **does not automatically import spreadsheet rows**.
+A private, owner-only finance dashboard: transactions, budgets, savings goals, income, client receivables, CSV and JSON exports. The original interface and API are preserved.
 
-## Features
+**Deployment instructions:** read [VERCEL_SETUP.md](VERCEL_SETUP.md).
 
-- Monthly and annual tracking without starting a new file each month
-- Client invoices with USD/PKR conversion, partial receipts, payment dates, and outstanding balances
-- Personal expenses grouped into categories
-- Editable month-specific spending limits
-- Savings goals, progress and deadlines
-- Yearly cash-flow chart, monthly spending breakdown, client receivables
-- Search, edit and delete transactions
-- Authenticated CSV export and JSON backup
-- Responsive dark-mode UI, no external scripts or analytics
+**Persistence:** PostgreSQL via `DATABASE_URL` is required whenever `APP_ENV=production`; SQLite is supported only as a convenience in local development. Database schema is initialized automatically on first request. Do not commit connection strings or passwords.
 
-**Accounting convention:** For an income invoice, `Date` is when invoiced, and `Date received` is when money arrived. Monthly income cash flow uses the receipt date; outstanding invoices use the invoice date. Multiple receipts paid on separate dates should be entered as separate invoice portions, because this version permits one receipt date per invoice record. A goal's saved amount is manually tracked; it is not automatically subtracted from net cash flow.
+**Local testing:** `python -m unittest discover -s tests -v`; start locally with `python app.py` using a setup key in a local `.env` file.
 
-## Run locally (no installation required for Python web server)
-
-1. Install **Python 3.11+**.
-2. From the project folder: `cp .env.example .env` (Windows: `copy .env.example .env`).
-3. Generate a new secret using:
-   ```bash
-   python -c "import secrets; print(secrets.token_urlsafe(36))"
-   ```
-4. Edit `.env` and replace the `OWNER_SETUP_KEY` placeholder with that generated secret. **Never put the secret in source code, Git or screenshots.** Keep it available for initial account creation.
-5. Start the app: `python app.py`.
-6. Open `http://127.0.0.1:8000`. Create your owner account using the setup key, your email and a strong password (12+ chars). Sign in.
-
-Local `APP_ENV=development` allows HTTP on localhost only. It is **not appropriate for public hosting**.
-
-## Deploy securely on Render (persistent disk)
-
-1. Put the files in a **private repository** on GitHub.
-2. On Render, create a **Blueprint** using `render.yaml` from this repository. A **paid persistent disk** is needed; free/ephemeral storage is not sufficient for the included SQLite backend.
-3. Set `OWNER_SETUP_KEY` to a freshly generated long random value using Render's secure environment variable UI. **Do not paste it into a Git repo.**
-4. Confirm `APP_ENV=production`, `DATABASE_PATH=/data/finance.db`, and a persistent disk mounted to `/data`. Use Render-provided HTTPS. The production app requires the proxy to set `X-Forwarded-Proto: https`.
-5. Open the HTTPS address. The first-run account creation screen appears **only when the database has no users**. Create an owner password, then sign in. After setup, new registrations are disabled.
-6. Protect the Render account with MFA and enable backups/monitoring. Download regular backups through the app; verify restore procedures independently. Keep private copies of backups because JSON/CSV exports contain unencrypted financial data.
-
-**Important:** This code cannot be deployed on a stateless Vercel serverless function with the included SQLite database; serverless local storage is not persistent. Choose a host with a persistent volume or migrate the persistence layer to a managed SQL database. Never store real finances until persistence and backup have been verified on the host.
-
-## Security design
-
-- No open registration: one-time owner setup requires a host-managed secret. The setup route refuses additional accounts.
-- Passwords: salted, scrypt-hashed with strong work factor. Passwords are never stored in plaintext.
-- Random opaque session tokens are **hashed in the database**; session cookies are HttpOnly + SameSite=Strict, and Secure when `APP_ENV=production`. Expire after 7 days.
-- CSRF tokens on all state-changing actions, origin validation, restricted CORS, security headers, and HTTPS requirement on production.
-- Prepared SQL queries; per-user authorization on reads/edits/deletes. Input length and amount validation. Integer money units instead of floating-point storage.
-- Database-backed rate limiting on failed logins (6 attempts/15 minutes per origin IP).
-- CSV exports guard against spreadsheet formula injection.
-- No third-party frontend trackers, external fonts, or CDN scripts.
-
-This is a security-conscious foundation, **not a guarantee of zero vulnerabilities**. A real deployment still requires vendor patching, TLS, managed backups, infrastructure hardening, monitoring, and ideally a professional security review. SQLite data is not encrypted at rest by the application; disk encryption depends on your host.
-
-## Backend reference
-
-| Endpoint | Method | Description |
-| --- | --- | --- |
-| `/api/bootstrap` | GET | Session state + per-session CSRF token |
-| `/api/setup` | POST | One-time owner creation using setup key |
-| `/api/login` | POST | Rate-limited login |
-| `/api/logout` | POST | Destroy active session |
-| `/api/summary?month=YYYY-MM` | GET | Dashboard KPIs, chart, clients |
-| `/api/transactions?month=YYYY-MM` | GET | Up to 500 monthly transaction rows |
-| `/api/transactions` | POST | New transaction |
-| `/api/transactions/{id}` | PUT / DELETE | Edit / delete authorized transaction |
-| `/api/budgets?month=YYYY-MM` | GET | Monthly category budgets |
-| `/api/budgets` | PUT | Create or update a budget category |
-| `/api/goals` | GET / POST | Savings goals |
-| `/api/goals/{id}` | PUT / DELETE | Edit / delete savings goal |
-| `/api/export.csv` | GET | Full transaction export |
-| `/api/backup.json` | GET | JSON export of private data excluding credentials |
-
-State-changing API calls require `Content-Type: application/json` and `X-CSRF-Token` from `/api/bootstrap` or login response.
-
-## Backup recommendations
-
-A server operator can make a consistent SQLite backup without stopping the app:
-
-```bash
-python backup_db.py /path/to/secure-backup.db
-```
-
-Always secure backup files. JSON/CSV exports are not encrypted and should never be shared publicly. Restoring a SQLite database should be done while the app is stopped and after verifying the backup.
-
-## Run automated tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Tests use a temporary isolated database and cover account setup, login, lockout, CSRF, cross-origin blocking, invoices, paid/unpaid calculations, monthly budgets, savings goals, export, and logout.
-#
+If you already have records in a local SQLite database, see the optional `migrate_sqlite_to_postgres.py` script and migration steps in `VERCEL_SETUP.md`. A new PostgreSQL database does not automatically contain previous transactions.

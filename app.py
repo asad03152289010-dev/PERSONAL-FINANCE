@@ -1,7 +1,4 @@
-"""Private, single-owner finance application. No third-party runtime dependencies.
-
-Use behind an HTTPS reverse proxy in production, on a host with persistent storage.
-"""
+"""Private finance tracker; PostgreSQL for Vercel, optional SQLite locally."""
 from __future__ import annotations
 
 import csv
@@ -35,7 +32,10 @@ if dotenv.exists():
 
 APP_ENV = os.environ.get('APP_ENV', 'development')
 PRODUCTION = APP_ENV == 'production'
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 DB_FILE = Path(os.environ.get('DATABASE_PATH', str(ROOT / 'data' / 'finance.db'))).expanduser()
+if PRODUCTION and not DATABASE_URL:
+    raise RuntimeError('DATABASE_URL must be configured for production; SQLite storage is ephemeral on Vercel.')
 SETUP_KEY = os.environ.get('OWNER_SETUP_KEY', '')
 SETUP_ENABLED = len(SETUP_KEY) >= 24 and not SETUP_KEY.startswith('REPLACE_')
 MAX_BODY = 16 * 1024
@@ -45,11 +45,35 @@ CURRENCIES = {'PKR', 'USD'}
 NAME_RE = re.compile(r'^[\w &()\-.,/]{1,64}$', re.UNICODE)
 MONTH_RE = re.compile(r'^\d{4}-(0[1-9]|1[0-2])$')
 
-DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+if not DATABASE_URL:
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+class PostgresDB:
+    """Expose sqlite-like execute interface while using parameterized psycopg SQL."""
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, query, params=None):
+        # All app SQL uses positional '?' placeholders; psycopg expects '%s'.
+        # Queries are internal and never contain user-controlled SQL expressions.
+        return self.conn.execute(query.replace('?', '%s'), params)
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
 
 
 @contextmanager
 def connect():
+    if DATABASE_URL:
+        import psycopg
+        from psycopg.rows import dict_row
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=8) as conn:
+            yield PostgresDB(conn)
+        return
     db = sqlite3.connect(DB_FILE, timeout=10)
     try:
         db.row_factory = sqlite3.Row
@@ -64,7 +88,57 @@ def connect():
         db.close()
 
 
+PG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+ id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+ password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
+);
+CREATE TABLE IF NOT EXISTS sessions (
+ token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ csrf TEXT NOT NULL, expires_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS login_attempts (
+ id BIGSERIAL PRIMARY KEY, ip TEXT NOT NULL, attempted_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attempts_idx ON login_attempts(ip, attempted_at);
+CREATE TABLE IF NOT EXISTS transactions (
+ id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ date TEXT NOT NULL, received_date TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('income','expense')),
+ title TEXT NOT NULL, category TEXT NOT NULL, client TEXT NOT NULL DEFAULT '',
+ project TEXT NOT NULL DEFAULT '', currency TEXT NOT NULL CHECK(currency IN ('PKR','USD')),
+ amount_minor BIGINT NOT NULL CHECK(amount_minor > 0),
+ paid_minor BIGINT NOT NULL CHECK(paid_minor >= 0 AND paid_minor <= amount_minor),
+ rate TEXT NOT NULL, total_pkr_minor BIGINT NOT NULL,
+ received_pkr_minor BIGINT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
+);
+CREATE INDEX IF NOT EXISTS tx_user_date ON transactions(user_id, date);
+CREATE TABLE IF NOT EXISTS budgets (
+ id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ month TEXT NOT NULL, category TEXT NOT NULL,
+ limit_pkr_minor BIGINT NOT NULL CHECK(limit_pkr_minor >= 0),
+ UNIQUE(user_id,month,category)
+);
+CREATE TABLE IF NOT EXISTS savings_goals (
+ id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, target_pkr_minor BIGINT NOT NULL CHECK(target_pkr_minor > 0),
+ saved_pkr_minor BIGINT NOT NULL CHECK(saved_pkr_minor >= 0),
+ due_month TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS received_date TEXT NOT NULL DEFAULT '';
+UPDATE transactions SET received_date=date WHERE received_date='';
+"""
+
+
 def initialize():
+    if DATABASE_URL:
+        with connect() as db:
+            # Use separate statements for compatibility with pooled endpoints.
+            for sql in PG_SCHEMA.strip().split(';'):
+                if sql.strip():
+                    db.execute(sql)
+        return
     with connect() as db:
         db.execute('PRAGMA journal_mode=WAL')
         db.executescript('''
@@ -130,7 +204,16 @@ def initialize():
             db.execute("UPDATE transactions SET received_date=date WHERE received_date=''")
 
 
-initialize()
+_init_complete = False
+_init_lock = __import__("threading").Lock()
+
+def ensure_initialized():
+    global _init_complete
+    if not _init_complete:
+        with _init_lock:
+            if not _init_complete:
+                initialize()
+                _init_complete = True
 
 
 class HttpError(Exception):
@@ -358,7 +441,7 @@ def handle_api(environ, start_response, method, path):
         if session:
             return make_response(start_response, data={'authenticated': True, 'email': session['email'], 'csrf': session['csrf']})
         with connect() as db:
-            first_run = db.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0
+            first_run = db.execute('SELECT COUNT(*) AS count FROM users').fetchone()['count'] == 0
         token = secrets.token_urlsafe(28)
         return make_response(start_response, data={
             'authenticated': False, 'setup_required': first_run, 'setup_enabled': SETUP_ENABLED,
@@ -378,7 +461,7 @@ def handle_api(environ, start_response, method, path):
             raise HttpError(400, 'Password must be 12–128 characters.')
         with connect() as db:
             # For first-run setup only. Unique index prevents simultaneous duplicate owner records.
-            db.execute('BEGIN IMMEDIATE')
+            db.execute('SELECT pg_advisory_xact_lock(821697463)') if DATABASE_URL else db.execute('BEGIN IMMEDIATE')
             if db.execute('SELECT id FROM users LIMIT 1').fetchone():
                 raise HttpError(403, 'Owner account already exists.')
             db.execute('INSERT INTO users(email,password_hash) VALUES(?,?)', (email, hash_password(password)))
@@ -392,7 +475,7 @@ def handle_api(environ, start_response, method, path):
         now = int(dt.datetime.now().timestamp())
         with connect() as db:
             db.execute('DELETE FROM login_attempts WHERE attempted_at<?', (now - 3600,))
-            hits = db.execute('SELECT COUNT(*) FROM login_attempts WHERE ip=? AND attempted_at>?', (ip, now - 900)).fetchone()[0]
+            hits = db.execute('SELECT COUNT(*) AS count FROM login_attempts WHERE ip=? AND attempted_at>?', (ip, now - 900)).fetchone()['count']
             if hits >= 6:
                 raise HttpError(429, 'Too many attempts. Try again in 15 minutes.')
             user = db.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
@@ -439,7 +522,7 @@ def handle_api(environ, start_response, method, path):
             clients = db.execute('''SELECT client, SUM(total_pkr_minor) total, SUM(received_pkr_minor) paid
                 FROM transactions WHERE user_id=? AND kind='income' AND TRIM(client)<>''
                 GROUP BY client ORDER BY total DESC LIMIT 15''', (uid,)).fetchall()
-            all_count = db.execute('SELECT COUNT(*) FROM transactions WHERE user_id=?', (uid,)).fetchone()[0]
+            all_count = db.execute('SELECT COUNT(*) AS count FROM transactions WHERE user_id=?', (uid,)).fetchone()['count']
         income = sum(r['received_pkr_minor'] for r in tx if r['kind'] == 'income' and r['received_date'][:7] == month)
         expenses = sum(r['received_pkr_minor'] for r in tx if r['kind'] == 'expense' and r['date'][:7] == month)
         pending = sum(r['total_pkr_minor'] - r['received_pkr_minor'] for r in tx if r['kind'] == 'income' and r['date'][:7] == month)
@@ -451,7 +534,7 @@ def handle_api(environ, start_response, method, path):
         yearly = {f'{year}-{i:02d}': {'income': 0, 'expenses': 0} for i in range(1, 13)}
         for row in by_month:
             field = 'income' if row['kind'] == 'income' else 'expenses'
-            yearly[row['month']][field] = row['received']
+            yearly[row['month']][field] = int(row['received'] or 0)
         return make_response(start_response, data={
             'month': month, 'income': income / 100, 'expenses': expenses / 100, 'savings': (income - expenses) / 100,
             'pending': pending / 100, 'budget': budget_total / 100, 'all_count': all_count,
@@ -472,8 +555,9 @@ def handle_api(environ, start_response, method, path):
         values = build_transaction(request_json(environ))
         keys = list(values.keys())
         with connect() as db:
-            cur = db.execute(f"INSERT INTO transactions(user_id,{','.join(keys)}) VALUES(?,{','.join(['?']*len(keys))})", [uid] + list(values.values()))
-        return make_response(start_response, 201, {'id': cur.lastrowid, 'ok': True})
+            cur = db.execute(f"INSERT INTO transactions(user_id,{','.join(keys)}) VALUES(?,{','.join(['?']*len(keys))})" + (" RETURNING id" if DATABASE_URL else ""), [uid] + list(values.values()))
+            new_id = cur.fetchone()["id"] if DATABASE_URL else cur.lastrowid
+        return make_response(start_response, 201, {'id': new_id, 'ok': True})
 
     match = re.fullmatch(r'/api/transactions/(\d+)', path)
     if match and method in ('PUT', 'DELETE'):
@@ -582,6 +666,7 @@ def app(environ, start_response):
     method = environ.get('REQUEST_METHOD', 'GET').upper()
     path = environ.get('PATH_INFO', '/')
     try:
+        ensure_initialized()
         if PRODUCTION and environ.get('HTTP_X_FORWARDED_PROTO', environ.get('wsgi.url_scheme', 'http')) != 'https':
             # This requires HTTPS at the reverse proxy; no finance data sent over HTTP.
             return make_response(start_response, 403, {'error': 'HTTPS required.'})
